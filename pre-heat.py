@@ -5,6 +5,7 @@ import argparse
 import ConfigParser
 import json
 import multiprocessing
+import os
 import sgmllib
 import signal
 import StringIO
@@ -57,16 +58,27 @@ class LinkParser(sgmllib.SGMLParser):
 
 
 def read_in():
+    global ftoscan, fscanned, ferrors, error_count
     print 'Reading input files...'
     try:
-        ftoscan = open(to_scan_filename, 'r')
+        if not os.path.exists(errors_filename):
+            ferrors = open(errors_filename, 'w')
+        else:
+            ferrors = open(errors_filename, 'r+')
+            for line in ferrors:
+                error_count += 1
+        if not os.path.exists(scanned_filename):
+            fscanned = open(scanned_filename, 'w')
+        else:
+            fscanned = open(scanned_filename, 'r+')
+            for line in fscanned:
+                target, duration = line.strip().split(',')
+                scanned.add(target)
+        ftoscan = open(to_scan_filename, 'r+')
         for line in ftoscan:
-            toscan.append(line.strip())
-        ftoscan.close()
-        fscanned = open(scanned_filename, 'r')
-        for line in fscanned:
-            scanned.add(line.strip())
-        fscanned.close()
+            target = line.strip()
+            if not target in scanned and not target in toscan:
+                toscan.append(target)
     except Exception as e:
         print 'Error reading input file: {0}'.format(e)
 
@@ -75,33 +87,23 @@ def write_out():
     print 'Writing output files...'
     exception = False
     try:
-        fscanned = open(scanned_filename, 'w+')
-        for address in scanned:
-            fscanned.write(address + '\n')
         fscanned.flush()
         fscanned.close()
     except Exception as e:
         exception = True
         print 'Error writing scanned urls: {0}'.format(e)
     try:
-        ftoscan = open(to_scan_filename, 'w')
-        for address in toscan:
-            ftoscan.write(address + '\n')
         ftoscan.flush()
         ftoscan.close()
     except Exception as e:
         exception = True
         print 'Error updating to_scan urls: {0}'.format(e)
-    if errors:
-        try:
-            ferrors = open(errors_filename, 'w+')
-            for error in errors:
-                ferrors.write(','.join(error) + '\n')
-            ferrors.flush()
-            ferrors.close()
-        except Exception as e:
-            exception = True
-            print 'Error writing error log file: {0}'.format(e)
+    try:
+        ferrors.flush()
+        ferrors.close()
+    except Exception as e:
+        exception = True
+        print 'Error writing error log file: {0}'.format(e)
     if exception:
         sys.exit(1)
     print 'Done.'
@@ -109,12 +111,6 @@ def write_out():
 
 def signal_handler(signal, frame):
     print '\n\nCaught Shutdown Signal\n'
-    print "Killing all workers..."
-    for address in chunk:
-        if address not in scanned:
-            toscan.append(address)
-    pool.close()
-    pool.join()
     write_out()
     sys.exit(1)
 
@@ -132,19 +128,19 @@ def pull_html(target):
         this is the slow function we distribute to multiple worker processes
     '''
     url = urlparse.urlparse(target)
-    new_links = []
+    found_links = []
     error = None
     pull_start = datetime.now()
     try:
         response = urllib2.urlopen(target)
         page = response.read()
         parser.parse(page)
-        new_links = parser.get_hyperlinks()
+        found_links = parser.get_hyperlinks()
     except Exception as e:
         error = '{0}'.format(e)
 
     pull_duration = datetime.now() - pull_start
-    return (target, new_links, error, pull_duration)
+    return (target, found_links, error, pull_duration)
 
 
 def start_worker():
@@ -174,12 +170,12 @@ if __name__ == '__main__':
     errors_filename  = config.get('files', 'errors')
     pool_size = int(config.get('workers', 'pool_size'))
     config_url_roots = config.get('criteria', 'url_roots').split()
-    display_urls = bool(config.get('display', 'urls'))
-    display_scanned = bool(config.get('display', 'scanned'))
-    display_to_scan = bool(config.get('display', 'to_scan'))
-    display_errors = bool(config.get('display', 'errors'))
+    display_urls = 'True' == config.get('display', 'urls')
+    display_scanned = 'True' == config.get('display', 'scanned')
+    display_to_scan = 'True' == config.get('display', 'to_scan')
+    display_errors = 'True' == config.get('display', 'errors')
     display_every = int(config.get('display', 'every'))
-    display_timing = bool(config.get('display', 'timing'))
+    display_timing = 'True' == config.get('display', 'timing')
 
     print "Spinning up {0} workers".format(pool_size)
 
@@ -190,6 +186,10 @@ if __name__ == '__main__':
 
     signal.signal(signal.SIGINT, signal_handler)
 
+    ftoscan = None
+    fscanned = None
+    ferrors = None
+    error_count = 0
     read_in()
     if not len(toscan) > 0:
         print "nothing to scan."
@@ -230,16 +230,17 @@ if __name__ == '__main__':
 
         it = pool.imap(pull_html, chunk)
         for i in range(chunk_size):
-            target, new_links, error, target_duration = it.next()
+            target, found_links, error, target_duration = it.next()
 
             url = urlparse.urlparse(target)
             if error:
-                errors.append((target,error))
+                ferrors.write(','.join([target, str(error), str(target_duration)]) + '\n')
+                error_count += 1
                 print target
                 print '  ** Error: {0}'.format(error)
                 print ''
                 continue
-            for link in new_links:
+            for link in found_links:
                 # convert links to full urls for criteria checking
                 if link.startswith('/'):
                     link = url[0] + '://' + url[1] + link
@@ -254,9 +255,11 @@ if __name__ == '__main__':
                 if not criteria_check(link):
                     continue
 
-                if link not in scanned and link not in toscan and link not in chunk:
+                if not link in scanned and not link in toscan and not link in chunk:
+                    ftoscan.write(link + '\n')
                     toscan.append(link)
 
+            fscanned.write(','.join([target, str(target_duration)]) + '\n')
             scanned.add(target)
             count += 1
             if target_duration < shortest:
@@ -272,17 +275,21 @@ if __name__ == '__main__':
                 if display_to_scan:
                     print '  to-scan: {0}'.format(len(toscan))
                 if display_errors:
-                    if errors:
-                        print '  errors:  {0}'.format(len(errors))
+                    if error_count > 0:
+                        print '  errors:  {0}'.format(error_count)
                 if display_timing:
-                    print '  link time  : {0}'.format(str(target_duration)[3:-4])
-                    print '    average  : {0}'.format(str(average)[3:-4])
-                    print '    fastest  : {0}'.format(str(shortest)[3:-4])
-                    print '    slowest  : {0}'.format(str(longest)[3:-4])
-                    print '  total time : {0}'.format(str(datetime.now() - start)[2:-4])
+                    print '  link time  : {0}'.format(str(target_duration)[:-4])
+                    print '    average  : {0}'.format(str(average)[:-4])
+                    print '    fastest  : {0}'.format(str(shortest)[:-4])
+                    print '    slowest  : {0}'.format(str(longest)[:-4])
+                    print '  total time : {0}'.format(str(datetime.now() - start)[:-4])
+                fscanned.flush()
+                ftoscan.flush()
+                ferrors.flush()
                 print ''
 
     pool.close()
     pool.join()
     write_out()
+    print "*** total time: {0}".format(str(datetime.now() - start)[:-4])
 
