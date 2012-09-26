@@ -2,6 +2,6 @@
 
 # default input and output files that pre-heat uses
 to_scan.urls
-scanned.urls
+scanned.csv
 errors.csv
 
